@@ -1,18 +1,35 @@
 AWSTemplateFormatVersion: 2010-09-09
+# CHANGE: Description rewritten. The old one described a single EC2 instance. This template now
+# builds the whole application layer on top of the network created by lab-network.yaml.
 Description: >-
-  Application Template: Demonstrates how to reference resources from a different stack.
-  This template provisions an EC2 instance in a VPC Subnet provisioned in a different stack.
+  Application Template: Builds the cafe application layer on top of the network stack
+  (lab-network.yaml). Creates a bastion host, an Application Load Balancer, an Auto Scaling
+  group of web servers in private subnets, and a MariaDB RDS database.
 
+# CHANGE: Summary list updated to match what the template now creates.
 # This template creates:
-#   Amazon EC2 instance
-#   Security Group
+#   4 Security Groups (bastion, load balancer, web servers, database)
+#   Bastion EC2 instance (public subnet 1)
+#   Application Load Balancer, Target Group and HTTP Listener
+#   Launch Template and Auto Scaling Group (private subnets) with a CPU scaling policy
+#   DB Subnet Group and MariaDB RDS instance (private subnets)
+#
+# How the pieces connect (traffic flow):
+#   Internet -> Load Balancer (public subnets) -> Web servers (private subnets) -> Database (private subnets)
+#   You -> Bastion (public subnet 1) -> Web servers (SSH only)
+# Each arrow is allowed by a security group rule, and nothing else is allowed.
 
 ######################
 # Parameters section
 ######################
 
+# Parameters are values you supply when you create the stack. They let you change settings
+# without editing the template. Resources read them with !Ref.
 Parameters:
 
+  # KEPT: The name of the network stack (the stack created from lab-network.yaml).
+  # This template uses it to build the names of the values it imports from that stack,
+  # for example "lab-network-VPCID". If you named your network stack differently, change this.
   NetworkStackName:
     Description: >-
       Name of an active CloudFormation stack that contains the networking
@@ -23,9 +40,105 @@ Parameters:
     AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
     Default: lab-network
 
+  # CHANGE: The default now points to the Amazon Linux 2023 image instead of Amazon Linux 2.
+  # The Type "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>" means the default is not an
+  # AMI ID itself but the NAME of an AWS Systems Manager (SSM) parameter. CloudFormation looks
+  # the name up when the stack is created and uses the current AMI ID it finds there. That way
+  # you always get the latest patched image without hardcoding an ID that differs per region.
   AmazonLinuxAMIID:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  # CHANGE (NEW): Your computer's public IP in CIDR form, for example 203.0.113.10/32.
+  # The "/32" means "exactly this one address". Only this address may SSH to the bastion.
+  # There is no default on purpose: a default would be someone else's address, or would
+  # have to be open to the world. AllowedPattern is a regular expression the value must match;
+  # this one requires four numbers separated by dots, ending in /32.
+  WorkstationIP:
+    Type: String
+    Description: Your public IP in CIDR form with /32, for example 203.0.113.10/32
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/32$'
+    ConstraintDescription: Must be a single IPv4 address in CIDR form ending in /32, for example 203.0.113.10/32
+
+  # CHANGE (NEW): The name of an existing EC2 key pair in us-east-1. This type makes the
+  # console show a drop-down of your key pairs and makes CloudFormation check that it exists.
+  # The key pair is NOT created here. It is used to SSH to the bastion and the web servers.
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafe-app-key
+    Description: Existing EC2 key pair used for SSH
+
+  # CHANGE (NEW): Size of the bastion and the web servers.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the bastion and the web servers
+
+  # CHANGE (NEW): The name of an existing IAM instance profile (the wrapper that gives an EC2
+  # instance an IAM role). It is NOT created by this template. The web servers use it to
+  # download index.php from S3, so the role behind it needs permission to read that bucket.
+  InstanceProfileName:
+    Type: String
+    Default: cafe-app-role
+    Description: Name of an existing IAM instance profile for the web servers
+
+  # CHANGE (NEW): Auto Scaling group sizes. Min is the fewest servers it will ever keep,
+  # Max is the most it may scale out to, and Desired is how many it starts with.
+  ASGMinSize:
+    Type: Number
+    Default: 2
+    Description: Minimum number of web servers
+
+  ASGMaxSize:
+    Type: Number
+    Default: 6
+    Description: Maximum number of web servers
+
+  ASGDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Number of web servers to start with
+
+  # CHANGE (NEW): The scaling policy tries to keep average CPU across all web servers at
+  # this percentage. Above it, servers are added. Well below it, servers are removed.
+  CPUTargetValue:
+    Type: Number
+    Default: 25
+    Description: Target average CPU utilization (percent) for scaling
+
+  # CHANGE (NEW): Database settings.
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS instance class
+
+  # Multi-AZ keeps a standby copy of the database in another AZ and fails over automatically.
+  # It doubles the database cost. Only the text "true" or "false" is accepted.
+  DBMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create a standby database in a second Availability Zone
+
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: Master user name for the database
+
+  # NoEcho: true hides the value: the console shows dots and CloudFormation will not display it
+  # in the stack's parameter list or in API output. There is deliberately no default, so you
+  # must type a password each time and it is never stored in this file.
+  # The pattern forbids / " @ and spaces because RDS does not allow those in passwords.
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '^[^/"@ ]+$'
+    ConstraintDescription: 8 to 41 characters; cannot contain / " @ or spaces
+    Description: Master password for the database
 
 ######################
 # Resources section
@@ -33,78 +146,58 @@ Parameters:
 
 Resources:
 
-  WebServerInstance:
-    Type: AWS::EC2::Instance
-    Metadata:
-      'AWS::CloudFormation::Init':
-        configSets:
-          All:
-            - ConfigureSampleApp
-        ConfigureSampleApp:
-          packages:
-            yum:
-              httpd: []
-          files:
-            /var/www/html/index.html:
-              content: |
-                <img src="https://s3.amazonaws.com/cloudformation-examples/cloudformation_graphic.png" alt="AWS CloudFormation Logo"/>
-                <h1>Congratulations, you have successfully launched the AWS CloudFormation sample.</h1>
-              mode: 000644
-              owner: apache
-              group: apache
-          services:
-            sysvinit:
-              httpd:
-                enabled: true
-                ensureRunning: true
-    Properties:
-      InstanceType: t2.micro
-      ImageId: !Ref AmazonLinuxAMIID
-      NetworkInterfaces:
-        - GroupSet:
-            - !Ref WebServerSecurityGroup
-          AssociatePublicIpAddress: true
-          DeviceIndex: 0
-          DeleteOnTermination: true
-          SubnetId:
-            Fn::ImportValue:
-              !Sub ${NetworkStackName}-SubnetID
-      Tags:
-        - Key: Name
-          Value: Web Server
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash -xe
-          yum update -y aws-cfn-bootstrap
-          # Install the files and packages from the metadata
-          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerInstance --configsets All --region ${AWS::Region}
-          # Signal the status from cfn-init
-          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT5M
+  ## Removed resources (kept as notes so you can see what the old template did)
 
-  DiskVolume:
-    Type: AWS::EC2::Volume
-    Properties:
-      Size: 100
-      AvailabilityZone: !GetAtt WebServerInstance.AvailabilityZone
-      Tags:
-        - Key: Name
-          Value: Web Data
-    DeletionPolicy: Snapshot
+  # REMOVED: WebServerInstance (a single EC2 web server, with its cfn-init Metadata,
+  # user data and CreationPolicy). Why: the application now runs on a group of servers managed
+  # by the Auto Scaling group below. Servers there are set up by the launch template's
+  # user data script instead of cfn-init. It also imported the old "-SubnetID" export, which
+  # the network stack no longer provides.
 
-  DiskMountPoint:
-    Type: AWS::EC2::VolumeAttachment
-    Properties:
-      InstanceId: !Ref WebServerInstance
-      VolumeId: !Ref DiskVolume
-      Device: /dev/sdh
+  # REMOVED: DiskVolume (a 100 GB extra disk). Why: Auto Scaling servers are disposable and
+  # can be replaced at any time, so they should not hold data. The application files come from
+  # the user data script and the application data lives in the RDS database.
 
-  WebServerSecurityGroup:
+  # REMOVED: DiskMountPoint (attached the extra disk to the old instance). Why: the disk it
+  # attached no longer exists, and an Auto Scaling group has no single instance to attach to.
+
+  # REMOVED: WebServerSecurityGroup (it allowed HTTP from the whole internet straight to the
+  # server). Why: web servers are now private and reached only through the load balancer. It
+  # is replaced by the four more specific security groups below.
+
+  ## Security Groups
+  # A security group is a firewall attached to a resource. It lists what traffic is allowed IN;
+  # all outbound traffic is allowed by default. Rules here point at other security groups
+  # instead of IP addresses, which means "anything that has that group attached".
+
+  # CHANGE (NEW): Firewall for the bastion. Only your workstation may connect over SSH (port 22).
+  # !Ref WorkstationIP inserts the value you typed for the parameter.
+  # Fn::ImportValue reads a value that ANOTHER stack exported (see the Outputs section of
+  # lab-network.yaml). It is how this stack finds the VPC. The name is built with !Sub, which
+  # replaces ${NetworkStackName} with the parameter's value, giving "lab-network-VPCID".
+  # Note: the other stack cannot be deleted while this one uses its exports.
+  BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Enable HTTP ingress
+      GroupDescription: SSH from the workstation IP only
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationIP
+      Tags:
+        - Key: Name
+          Value: cafe-bastion-sg
+
+  # CHANGE (NEW): Firewall for the load balancer. It is the public front door, so HTTP (port 80)
+  # is open to any address (0.0.0.0/0 means "anywhere").
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from anywhere
       VpcId:
         Fn::ImportValue:
           !Sub ${NetworkStackName}-VPCID
@@ -115,13 +208,281 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: Web Server Security Group
+          Value: cafe-alb-sg
+
+  # CHANGE (NEW): Firewall for the web servers. HTTP is allowed only from the load balancer's
+  # security group (so visitors cannot bypass the load balancer), and SSH only from the
+  # bastion's security group (so the bastion is the only way to log in).
+  # SourceSecurityGroupId takes a security group's ID, which is what !Ref returns for one.
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from the load balancer, SSH from the bastion
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-web-sg
+
+  # CHANGE (NEW): Firewall for the database. MySQL/MariaDB uses port 3306, and only the web
+  # servers may connect to it.
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MariaDB from the web servers only
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-db-sg
+
+  ## Bastion Host
+
+  # CHANGE (NEW): The bastion is a small server in a public subnet that you SSH into, and
+  # from there you SSH to the private web servers (which have no public address).
+  # It sits in public subnet 1 (imported from the network stack). The subnet does not hand
+  # out public IPs automatically, so AssociatePublicIpAddress: true on the network interface
+  # requests one for this instance. GroupSet lists the security groups to attach.
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmazonLinuxAMIID
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref BastionSecurityGroup
+          AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          SubnetId:
+            Fn::ImportValue:
+              !Sub ${NetworkStackName}-PublicSubnet1ID
+      Tags:
+        - Key: Name
+          Value: cafe-bastion
+
+  ## Load Balancer
+
+  # CHANGE (NEW): The Application Load Balancer receives visitors' requests and spreads them
+  # across the web servers. "internet-facing" gives it a public address. It is placed in both
+  # public subnets (one per AZ), which is required and keeps it available if one AZ fails.
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PublicSubnet1ID
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PublicSubnet2ID
+      Tags:
+        - Key: Name
+          Value: cafe-alb
+
+  # CHANGE (NEW): The target group is the list of web servers the load balancer sends traffic
+  # to. The Auto Scaling group registers its servers here automatically. The load balancer
+  # requests /index.php from each server regularly, and stops sending visitors to any server
+  # that does not answer successfully.
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /index.php
+      Tags:
+        - Key: Name
+          Value: cafe-web-tg
+
+  # CHANGE (NEW): The listener watches for connections on a port (HTTP 80 here) and decides
+  # what to do with them. This one forwards everything to the web target group.
+  # An ARN is an AWS resource's full unique name. For load balancers and target groups, !Ref
+  # returns the ARN, which is exactly what the listener needs to know where to attach and
+  # where to forward traffic.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  ## Web Servers (Launch Template + Auto Scaling Group)
+
+  # CHANGE (NEW): The launch template is the recipe for a web server: which image, size,
+  # firewall, IAM role, key pair, and startup script. The Auto Scaling group uses it every
+  # time it needs a new server.
+  # IamInstanceProfile gives the server the permissions of the existing cafe-app-role.
+  # UserData is a script that runs once as the server first boots. EC2 requires it to be
+  # Base64-encoded text, and Fn::Base64 does that encoding for us so we can write it as
+  # plain text. What the script does, line by line:
+  #   - updates the operating system and installs Apache (httpd), PHP, the MariaDB client and unzip
+  #   - starts Apache now and on every boot
+  #   - copies index.php from the seis665-public S3 bucket (needs the role's S3 permission)
+  #   - downloads and unpacks the cafe application and the AWS PHP library, and makes them readable
+  #   - sets the PHP timezone and restarts PHP and Apache
+  # The servers are in private subnets, so they reach the internet for these downloads
+  # through the NAT gateways from the network stack.
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmazonLinuxAMIID
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y httpd php php-mysqlnd mariadb105 unzip
+            systemctl enable --now httpd
+            aws s3 cp s3://seis665-public/index.php /var/www/html/
+            cd /tmp
+            curl -sL -o cafe.zip https://github.com/rclc/cafe-app/raw/main/cafe.zip
+            curl -sL -o aws.phar https://github.com/rclc/cafe-app/raw/main/aws.phar
+            unzip -o cafe.zip -d /var/www/html/
+            mv aws.phar /var/www/html/cafe/
+            chmod -R +r /var/www/html/cafe/
+            sed -i '2i date.timezone = "America/New_York"' /etc/php.ini
+            systemctl restart php-fpm httpd
+
+  # CHANGE (NEW): The Auto Scaling group keeps the right number of web servers running.
+  # - VPCZoneIdentifier: the private subnets (one per AZ) where servers are launched.
+  # - Version uses !GetAtt to read LatestVersionNumber from the launch template, so the group
+  #   always uses the newest version of the recipe.
+  # - TargetGroupARNs: registers each new server with the load balancer's target group.
+  # - HealthCheckType ELB: a server is replaced if the LOAD BALANCER's health check fails,
+  #   not just if EC2 itself stops. The 180-second grace period gives a new server time to
+  #   finish the user data script before health checks can count against it.
+  # - Tags: PropagateAtLaunch copies the Name tag onto each server it creates.
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PrivateSubnet1ID
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PrivateSubnet2ID
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref ASGMinSize
+      MaxSize: !Ref ASGMaxSize
+      DesiredCapacity: !Ref ASGDesiredCapacity
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: cafe-web-server
+          PropagateAtLaunch: true
+
+  # CHANGE (NEW): Target tracking scaling policy. You choose a metric and a target and
+  # Auto Scaling adds or removes servers to stay near it. The metric here is the average CPU
+  # of all servers in the group (ASGAverageCPUUtilization), and the target is CPUTargetValue.
+  WebScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CPUTargetValue
+
+  ## Database
+
+  # CHANGE (NEW): A DB subnet group tells RDS which subnets it may place the database in.
+  # We give it both private subnets (different AZs), which Multi-AZ requires.
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the cafe database
+      SubnetIds:
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PrivateSubnet1ID
+        - Fn::ImportValue:
+            !Sub ${NetworkStackName}-PrivateSubnet2ID
+
+  # CHANGE (NEW): The MariaDB database (Amazon RDS manages the server, backups and patching).
+  # - PubliclyAccessible: false keeps it off the internet; only the web servers can reach it.
+  # - EngineVersion is pinned to 10.6.28 (available in us-east-1) so rebuilds are predictable.
+  # - gp2 is a general-purpose SSD volume; AllocatedStorage is its size in GB.
+  # - MultiAZ comes from the DBMultiAZ parameter.
+  # DeletionPolicy controls what CloudFormation does with a resource when the stack is deleted.
+  # RDS databases normally default to taking a final snapshot (a backup that keeps costing
+  # money). "Delete" removes the database with NO snapshot, which suits a class assignment but
+  # means the data is gone permanently. UpdateReplacePolicy is the same idea for the case where
+  # a stack UPDATE forces CloudFormation to replace the database with a new one: "Delete"
+  # removes the old one with no snapshot.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mariadb
+      EngineVersion: 10.6.28
+      DBInstanceClass: !Ref DBInstanceClass
+      StorageType: gp2
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      MultiAZ: !Ref DBMultiAZ
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
 
 ######################
 # Outputs section
 ######################
 
 Outputs:
-  URL:
-    Description: URL of the sample website
-    Value: !Sub 'http://${WebServerInstance.PublicDnsName}'
+
+  # REMOVED: The "URL" output (http://<single web server's DNS name>). Why: the single web
+  # server no longer exists. Visitors now use the load balancer's address, below.
+
+  # CHANGE (NEW): The address to put in a browser. !GetAtt reads DNSName from the load balancer.
+  LoadBalancerURL:
+    Description: URL of the cafe application (through the load balancer)
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  # CHANGE (NEW): The bastion's public IP, for SSH from your workstation.
+  BastionPublicIP:
+    Description: Public IP address of the bastion host
+    Value: !GetAtt BastionInstance.PublicIp
+
+  # CHANGE (NEW): The database's address, used by the application to connect (port 3306).
+  DatabaseEndpoint:
+    Description: Database endpoint address
+    Value: !GetAtt Database.Endpoint.Address
