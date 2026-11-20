@@ -1,12 +1,60 @@
 AWSTemplateFormatVersion: 2010-09-09
+# CHANGE: Description updated. It used to say only "a VPC with DNS and public IPs enabled".
+# It now describes the full network: 2 public subnets, 2 private subnets, 2 NAT gateways.
 Description: >-
-  Network Template: Sample template that creates a VPC with DNS and public IPs enabled.
+  Network Template: Creates a VPC with DNS enabled, two public subnets, two private subnets
+  (one of each in two Availability Zones), and a NAT gateway per AZ for private outbound internet access.
 
+# CHANGE: This summary list was updated to match everything the template now creates.
 # This template creates:
 #   VPC
 #   Internet Gateway
 #   Public Route Table
-#   Public Subnet
+#   Public Subnet 1 and Public Subnet 2 (one per Availability Zone)
+#   Private Subnet 1 and Private Subnet 2 (one per Availability Zone)
+#   2 Elastic IPs and 2 NAT Gateways (one per public subnet)
+#   2 Private Route Tables (each sends internet traffic to the NAT gateway in the same AZ)
+
+######################
+# Parameters section
+######################
+
+# CHANGE (NEW SECTION): Parameters are values you can supply when you create the stack, so
+# you don't have to edit the template to change them. Each one has a Default, which is used
+# if you don't type anything in. The resources below read these values with !Ref.
+# These are the five IP address ranges (CIDR blocks) from your previous assignment.
+Parameters:
+
+  # CHANGE (NEW): The IP range for the whole VPC. Every subnet CIDR must fit inside it.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  # CHANGE (NEW): Public subnet 1 range (256 addresses). It will live in the first AZ.
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: CIDR block for public subnet 1 (first Availability Zone)
+
+  # CHANGE (NEW): Public subnet 2 range (256 addresses). It will live in the second AZ.
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for public subnet 2 (second Availability Zone)
+
+  # CHANGE (NEW): Private subnet 1 range (512 addresses; /23 is twice the size of /24).
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.2.0/23
+    Description: CIDR block for private subnet 1 (first Availability Zone)
+
+  # CHANGE (NEW): Private subnet 2 range (512 addresses). 10.0.4.0/23 does not overlap
+  # with private subnet 1 (10.0.2.0 - 10.0.3.255), so the two ranges are safe together.
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/23
+    Description: CIDR block for private subnet 2 (second Availability Zone)
 
 ######################
 # Resources section
@@ -16,18 +64,27 @@ Resources:
 
   ## VPC
 
+  # KEPT: The VPC is your private, isolated network in AWS. Everything else in this file
+  # lives inside it.
   VPC:
     Type: AWS::EC2::VPC
     Properties:
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      CidrBlock: 10.0.0.0/16
+      # CHANGE: Was the hardcoded value 10.0.0.0/16. !Ref VpcCidr means "use the value of the
+      # parameter named VpcCidr". !Ref is the most common intrinsic function (a built-in
+      # CloudFormation function). On a parameter it returns the parameter's value; on a
+      # resource it returns that resource's main identifier (for example a VPC ID or subnet ID).
+      CidrBlock: !Ref VpcCidr
       
   ## Internet Gateway
 
+  # KEPT: The internet gateway is the VPC's door to the internet. It is used by the public subnets.
   InternetGateway:
     Type: AWS::EC2::InternetGateway
   
+  # KEPT: A gateway does nothing until it is attached to a VPC. This resource attaches it.
+  # Here !Ref VPC and !Ref InternetGateway return the IDs of those resources.
   VPCGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
@@ -36,11 +93,16 @@ Resources:
   
   ## Public Route Table
 
+  # KEPT: A route table is a set of rules that says where network traffic goes.
+  # This one is used by both public subnets.
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
   
+  # KEPT: The rule that makes subnets "public": all non-local traffic (0.0.0.0/0 means
+  # "any address") goes to the internet gateway.
+  # DependsOn makes CloudFormation wait until the gateway is attached before creating this route.
   PublicRoute:
     Type: AWS::EC2::Route
     DependsOn: VPCGatewayAttachment
@@ -49,24 +111,40 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
   
-  ## Public Subnet
-  
+  ## Public Subnet 1
+
+  # KEPT (logical ID stays "PublicSubnet" so the existing resource is not renamed): this is public subnet 1.
+  # A subnet is a slice of the VPC's IP range that lives in a single Availability Zone (AZ).
+  # MapPublicIpOnLaunch is intentionally NOT set, as requested. The bastion host gets its
+  # public IP in the application template.
   PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: 10.0.0.0/24
+      # CHANGE: Was the hardcoded value 10.0.0.0/24. Now reads the PublicSubnet1Cidr parameter.
+      CidrBlock: !Ref PublicSubnet1Cidr
+      # KEPT: Picks the first AZ in the region.
+      # !GetAZs returns the list of AZ names in a region, for example [us-east-1a, us-east-1b, ...].
+      # Ref: AWS::Region is the same as !Ref AWS::Region. It uses a "pseudo parameter" that CloudFormation
+      # fills in automatically with the region the stack is deployed in.
+      # !Select picks one item from a list by position, starting at 0. So 0 is the first AZ.
+      # Using these functions means the template works in any region without hardcoding AZ names.
       AvailabilityZone: !Select 
         - 0
         - !GetAZs 
           Ref: AWS::Region
   
+  # KEPT: Links public subnet 1 to the public route table, which is what sends its traffic to the internet gateway.
   PublicSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
   
+  # KEPT: A network ACL (NACL) is a firewall at the subnet level. This links public subnet 1 to the VPC's default NACL.
+  # !GetAtt reads an attribute of a resource (a value the resource has besides its ID). Here it
+  # reads DefaultNetworkAcl from the VPC, which is the NACL AWS creates automatically with every VPC.
+  # The list form (- VPC, - DefaultNetworkAcl) is the same as !GetAtt VPC.DefaultNetworkAcl.
   PublicSubnetNetworkAclAssociation:
     Type: AWS::EC2::SubnetNetworkAclAssociation
     Properties:
@@ -74,19 +152,205 @@ Resources:
       NetworkAclId: !GetAtt 
         - VPC
         - DefaultNetworkAcl
+
+  ## Public Subnet 2
+
+  # CHANGE (NEW): The second public subnet, in the second AZ. Two AZs means the network
+  # keeps working if one AZ has an outage. Public subnet 2 will hold NAT gateway 2.
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      # Same as public subnet 1 but !Select 1 picks the SECOND AZ in the list (positions start at 0).
+      # This is what makes the two public subnets sit in different AZs.
+      AvailabilityZone: !Select 
+        - 1
+        - !GetAZs 
+          Ref: AWS::Region
+
+  # CHANGE (NEW): Associates public subnet 2 with the SAME public route table as public subnet 1,
+  # so it also sends internet traffic through the internet gateway.
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # CHANGE (NEW): Associates public subnet 2 with the default NACL, matching public subnet 1.
+  # (The default NACL would apply automatically anyway; this keeps the two public subnets
+  # configured the same way, and keeps your existing NACL in use.)
+  PublicSubnet2NetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      NetworkAclId: !GetAtt 
+        - VPC
+        - DefaultNetworkAcl
+
+  ## Private Subnets
+
+  # CHANGE (NEW): Private subnet 1, in the first AZ. Private means it has no route to the internet gateway,
+  # so nothing on the internet can reach it directly. It will use NAT gateway 1 (below) for outbound traffic.
+  # It has no NACL association resource because it automatically uses the VPC's default NACL.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: AWS::Region
+
+  # CHANGE (NEW): Private subnet 2, in the second AZ. It will use NAT gateway 2 (below).
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select 
+        - 1
+        - !GetAZs 
+          Ref: AWS::Region
+
+  ## Elastic IPs for the NAT Gateways
+
+  # CHANGE (NEW): An Elastic IP is a fixed public IPv4 address. A NAT gateway needs one so
+  # that traffic from private subnets appears to come from a stable public address.
+  # This one is for NAT gateway 1.
+  # DependsOn: VPCGatewayAttachment makes CloudFormation wait until the internet gateway is
+  # attached to the VPC before creating this address, because an Elastic IP used by a NAT gateway
+  # requires the VPC to have a working internet gateway.
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      # "vpc" means this address is for use inside a VPC (as opposed to the old EC2-Classic).
+      Domain: vpc
+
+  # CHANGE (NEW): Elastic IP for NAT gateway 2, with the same DependsOn for the same reason.
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  ## NAT Gateways
+
+  # CHANGE (NEW): A NAT gateway lets resources in a private subnet start connections to the internet
+  # (for example to download updates) without allowing the internet to start connections to them.
+  # It must sit in a PUBLIC subnet, because it needs the internet gateway route to reach the internet.
+  # This one is in public subnet 1 (first AZ) and serves private subnet 1.
+  # We make one per AZ so that an outage in one AZ does not cut off private subnets in the other.
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      # !GetAtt reads the AllocationId attribute from the Elastic IP. The AllocationId is the
+      # identifier the NAT gateway needs in order to use that address. (!Ref on an EIP would
+      # return the IP address itself, which is not what the NAT gateway wants here.)
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+
+  # CHANGE (NEW): NAT gateway 2, in public subnet 2 (second AZ), using Elastic IP 2. Serves private subnet 2.
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+
+  ## Private Route Tables
+
+  # CHANGE (NEW): A private route table for the first AZ. There are two private route tables (not one)
+  # because each needs a different default route: one to NAT gateway 1 and one to NAT gateway 2.
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  # CHANGE (NEW): Sends all internet-bound traffic (0.0.0.0/0) from private route table 1 to NAT gateway 1,
+  # which is in the same AZ. Keeping traffic in its own AZ avoids cross-AZ data charges and
+  # a dependency on the other AZ.
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  # CHANGE (NEW): Connects private subnet 1 to private route table 1, so the route above takes effect for it.
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  # CHANGE (NEW): A private route table for the second AZ.
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  # CHANGE (NEW): Sends 0.0.0.0/0 from private route table 2 to NAT gateway 2 (same AZ).
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  # CHANGE (NEW): Connects private subnet 2 to private route table 2.
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
   
 ######################
 # Outputs section
 ######################
 
+# CHANGE: Outputs publish values (like IDs) after the stack is created. An Export gives the value
+# a name that OTHER stacks can import, for example your application template can import the
+# subnet IDs to launch the bastion and other servers into this network.
+# !Sub builds text by replacing ${...} placeholders with values. ${AWS::StackName} is a pseudo
+# parameter holding the name of this stack, so the export names are unique per stack,
+# for example "lab-network-VPCID" if the stack is named "lab-network".
 Outputs:
   
-  PublicSubnet:
-    Description: The subnet ID to use for public web servers
+  # CHANGE: This output was named PublicSubnet and exported as ${AWS::StackName}-SubnetID.
+  # The old -SubnetID export has been REMOVED because there are now two public subnets, so
+  # "SubnetID" would no longer say which one it meant. It is replaced by the explicit
+  # -PublicSubnet1ID and -PublicSubnet2ID exports. Any other stack that imported -SubnetID must
+  # be updated to import -PublicSubnet1ID instead.
+  PublicSubnet1:
+    Description: Public subnet 1 ID (first Availability Zone)
     Value: !Ref PublicSubnet
     Export:
-      Name: !Sub '${AWS::StackName}-SubnetID'
+      Name: !Sub '${AWS::StackName}-PublicSubnet1ID'
 
+  # CHANGE (NEW): Public subnet 2 ID, for other stacks to import.
+  PublicSubnet2:
+    Description: Public subnet 2 ID (second Availability Zone)
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2ID'
+
+  # CHANGE (NEW): Private subnet 1 ID, for other stacks to import.
+  PrivateSubnet1:
+    Description: Private subnet 1 ID (first Availability Zone)
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1ID'
+
+  # CHANGE (NEW): Private subnet 2 ID, for other stacks to import.
+  PrivateSubnet2:
+    Description: Private subnet 2 ID (second Availability Zone)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2ID'
+
+  # KEPT: The VPC ID export is unchanged (name is still ${AWS::StackName}-VPCID).
   VPC:
     Description: VPC ID
     Value: !Ref VPC
